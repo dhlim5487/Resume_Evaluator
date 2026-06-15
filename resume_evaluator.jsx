@@ -20,6 +20,24 @@ const GREEN_BG = "#EDF6F0";
 const LINE = "#D8DCD8";
 const MUTE = "#6B746F";
 
+// Extracts plain text from an uploaded file. Handles .docx, .txt, .md.
+// Throws a clear message for unsupported types.
+async function extractFileText(file) {
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".docx")) {
+    const buf = await file.arrayBuffer();
+    const out = await mammoth.extractRawText({ arrayBuffer: buf });
+    if (!out.value.trim()) throw new Error("The file opened but contained no readable text.");
+    return out.value.trim();
+  }
+  if (name.endsWith(".txt") || name.endsWith(".md")) {
+    const text = await file.text();
+    if (!text.trim()) throw new Error("The file is empty.");
+    return text.trim();
+  }
+  throw new Error("Unsupported file. Use .docx, .txt, or .md — for PDF, copy-paste the text.");
+}
+
 function extractJSON(text) {
   const clean = text.replace(/```json|```/g, "").trim();
   const start = clean.indexOf("{");
@@ -66,12 +84,24 @@ async function askClaude(prompt, useSearch = false, maxTokens = 1500) {
 
 /* ── prompts ── */
 
+// Appends a language directive to any prompt. forceEnglish overrides to English
+// (for the Translate button); otherwise output follows the posting's language.
+function langInstruction(lang, forceEnglish) {
+  if (forceEnglish) {
+    return `\n\nIMPORTANT: Write ALL output values in English, regardless of the posting's language.`;
+  }
+  if (lang) {
+    return `\n\nIMPORTANT: Write ALL output values in ${lang} (the job posting's language), so the candidate reads everything in the posting's language. Keep field names/keys in English; translate only the values. Any text quoted verbatim from the resume stays in the resume's original language.`;
+  }
+  return `\n\nIMPORTANT: Detect the job posting's language and write ALL output values in that same language. Keep JSON keys in English; translate only the values. Text quoted verbatim from the resume stays in the resume's own language.`;
+}
+
 const fetchPostingPrompt = (url) => `Use web search to retrieve the job posting at this URL: ${url}
 
 Extract its full content. Respond ONLY with minified JSON, no markdown:
-{"found":bool,"title":str,"company":str,"posting_text":str}
+{"found":bool,"title":str,"company":str,"posting_text":str,"language":str}
 
-posting_text = condensed but COMPLETE extraction: every requirement, qualification, preference, responsibility, location, and visa/clearance note from the posting, in plain text. If the page can't be reached or isn't a job posting, set found:false and explain in posting_text.`;
+posting_text = condensed but COMPLETE extraction: every requirement, qualification, preference, responsibility, location, and visa/clearance note from the posting, in plain text. language = the human language the posting is written in, as an English name (e.g. "Korean", "English", "Japanese"). If the page can't be reached or isn't a job posting, set found:false and explain in posting_text.`;
 
 const fetchRefPrompt = (url) => `Use web search to read this page, which the candidate found while researching a job/company: ${url}
 
@@ -80,12 +110,13 @@ Pull out anything relevant to the role's requirements, preferences, restrictions
 
 extract = the relevant findings in plain text, under 200 words. If the page can't be reached, set found:false and say so briefly in extract.`;
 
-const reqPrompt = (resume, posting) => `You are a strict resume-vs-job-requirements engine. Compare the RESUME to the JOB POSTING.
+const reqPrompt = (resume, posting, lang, forceEnglish) => `You are a strict resume-vs-job-requirements engine. Compare the RESUME to the JOB POSTING.
 
 Respond ONLY with minified JSON, no markdown, no preamble. Schema:
-{"blockers":[{"text":str,"status":"pass"|"fail"|"unknown","note":str}],"musts":[{"text":str,"met":true|false|"unknown","time_to_fill":str|null,"question":str|null}],"plus":[{"text":str,"met":true|false|"partial"}],"summary":str}
+{"detected_language":str,"blockers":[{"text":str,"status":"pass"|"fail"|"unknown","note":str}],"musts":[{"text":str,"met":true|false|"unknown","time_to_fill":str|null,"question":str|null}],"plus":[{"text":str,"met":true|false|"partial"}],"summary":str}
 
 Rules:
+- detected_language = the language the JOB POSTING is written in (e.g. "Korean", "English", "Japanese").
 - blockers = hard walls only: visa/work authorization, security clearance, degree field, hard minimum years. Max 4. "unknown" if resume doesn't say.
 - musts = minimum requirements. Binary met. If NOT met and fillable (skill/cert), give realistic time_to_fill (e.g. "2-3 months"). If you cannot tell whether the candidate has it, set met:"unknown" and write a direct question asking if they have an example.
 - plus = nice-to-haves, "partial" allowed. Max 6 musts, 6 plus.
@@ -96,37 +127,38 @@ RESUME:
 ${resume}
 
 JOB POSTING:
-${posting}`;
+${posting}${langInstruction(lang, forceEnglish)}`;
 
-const flagPrompt = (resume, posting) => `You are a resume red-flag/green-flag reviewer. Review the RESUME against the JOB POSTING.
+const flagPrompt = (resume, posting, lang, forceEnglish) => `You are a resume red-flag/green-flag reviewer. Review the RESUME against the JOB POSTING.
 
 Respond ONLY with minified JSON, no markdown. Schema:
 {"red_flags":[{"location":str,"severity":"mechanical"|"content"|"fit","issue":str,"original_text":str,"suggested_text":str|null,"needs_input":bool,"question":str|null}],"green_flags":[{"text":str,"action":str}],"ats":{"matched":[str],"missing":[str]}}
 
 Rules:
 - mechanical = typos, tense, dates, ATS-breaking format. content = vague bullets, claimed-but-unevidenced skills. fit = role wants X, resume buries or lacks it.
-- For mechanical/content: needs_input=false, suggested_text = the actual rewritten text (problem→action→outcome form). original_text = exact text from resume.
-- For fit gaps where only the candidate knows if the experience exists: needs_input=true, suggested_text=null, question = direct question to the candidate.
-- Max 5 red flags (worst first), max 4 green flags. green action = how to surface it harder.
-- ats: exact terms from the posting. matched = appear in resume. missing = required terms absent. Max 8 each.
-- Never invent experience. Only rewrite what the resume actually claims.
-- Keep strings under 35 words.
+- For mechanical/content: needs_input=false. suggested_text MUST be a complete, ready-to-paste rewritten line in problem→action→outcome form with a CONCRETE detail or metric — not advice, not a description of what to do. BAD: "make this more specific" or "add a metric here". GOOD: "Diagnosed a parking-gate misconfiguration affecting 200+ daily users; resolved it in one shift through structured testing, avoiding a costly vendor update." original_text = exact text from resume, verbatim in the resume's language.
+- issue = name the specific problem in this specific line (e.g. "no outcome — doesn't say what the fix achieved"), not a generic label.
+- For fit gaps where only the candidate knows if the experience exists: needs_input=true, suggested_text=null, question = a specific question naming the missing requirement.
+- Max 4 red flags (worst first), max 3 green flags. green action = how to surface it harder.
+- ats: exact terms from the posting. matched = appear in resume. missing = required terms absent. Max 6 each.
+- Never invent experience or numbers. If the resume gives no metric, rewrite using only what's there but still make it concrete and outcome-focused.
+- CRITICAL: output ONE valid JSON object only. No line breaks inside string values. No unescaped double-quotes inside strings — use single quotes instead. Do not stop mid-array; if running long, return fewer red flags rather than truncating.
 
 RESUME:
 ${resume}
 
 JOB POSTING:
-${posting}`;
+${posting}${langInstruction(lang, forceEnglish)}`;
 
-const questionPrompt = (posting) => `Generate likely interview questions for this specific job posting, derived from its actual requirements.
+const questionPrompt = (posting, lang, forceEnglish) => `Generate likely interview questions for this specific job posting, derived from its actual requirements.
 
 Respond ONLY with minified JSON, no markdown: {"questions":[{"q":str,"why":str}]}
 Max 8. "why" = which requirement it probes, under 12 words.
 
 JOB POSTING:
-${posting}`;
+${posting}${langInstruction(lang, forceEnglish)}`;
 
-const marketPrompt = (posting) => `Use web search to find REAL, currently-open job postings similar to the one below. Match on JOB REQUIREMENTS and RESTRICTIONS (skills, years, degree, visa/clearance, location), not just job title.
+const marketPrompt = (posting, lang, forceEnglish) => `Use web search to find REAL, currently-open job postings similar to the one below. Match on JOB REQUIREMENTS and RESTRICTIONS (skills, years, degree, visa/clearance, location), not just job title.
 
 Respond ONLY with minified JSON, no markdown:
 {"recommendations":[{"company":str,"role":str,"salary_posted":bool,"salary":str|null,"location":str,"match_reason":str,"url":str,"source":str}],"note":str}
@@ -141,11 +173,11 @@ Rules:
 - CRITICAL: output ONE valid JSON object only. No line breaks inside string values. No unescaped double-quotes inside strings — use single quotes or omit them. Keep every string under 20 words. Do not stop mid-array; if you're running long, return fewer postings rather than truncating.
 
 TARGET JOB POSTING:
-${posting}`;
+${posting}${langInstruction(lang, forceEnglish)}`;
 
-const draftPrompt = (flag, answer) => `A resume reviewer flagged: "${flag.issue}" and asked the candidate: "${flag.question}". The candidate answered: "${answer}".
+const draftPrompt = (flag, answer, lang, forceEnglish) => `A resume reviewer flagged: "${flag.issue}" and asked the candidate: "${flag.question}". The candidate answered: "${answer}".
 
-Write ONE resume bullet from the candidate's answer in problem→action→outcome form. Use only facts the candidate stated — invent nothing. Respond ONLY with minified JSON: {"suggested_text":str}`;
+Write ONE resume bullet from the candidate's answer in problem→action→outcome form. Use only facts the candidate stated — invent nothing. Respond ONLY with minified JSON: {"suggested_text":str}${langInstruction(lang, forceEnglish)}`;
 
 /* ── small pieces ── */
 
@@ -348,6 +380,8 @@ export default function App() {
   const [fileErr, setFileErr] = useState(null);
   const [postingUrl, setPostingUrl] = useState("");
   const [postingPaste, setPostingPaste] = useState("");
+  const [postingFileName, setPostingFileName] = useState(null);
+  const [postingFileErr, setPostingFileErr] = useState(null);
   const [notes, setNotes] = useState("");
   const [refLinks, setRefLinks] = useState(["", ""]);
 
@@ -360,6 +394,8 @@ export default function App() {
   const [req, setReq] = useState(null);
   const [reqErr, setReqErr] = useState(null);
   const [reqLoading, setReqLoading] = useState(false);
+  const [lang, setLang] = useState(null); // posting's language, detected on first run
+  const [forceEnglish, setForceEnglish] = useState(false);
 
   const [flags, setFlags] = useState(null);
   const [flagErr, setFlagErr] = useState(null);
@@ -377,28 +413,33 @@ export default function App() {
 
   const [copied, setCopied] = useState(false);
 
-  /* ── resume file upload (.docx via mammoth, or plain text) ── */
+  /* ── resume file upload (.docx, .txt, .md) ── */
   const onFile = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
     setFileErr(null);
     try {
-      if (file.name.toLowerCase().endsWith(".docx")) {
-        const buf = await file.arrayBuffer();
-        const out = await mammoth.extractRawText({ arrayBuffer: buf });
-        if (!out.value.trim()) throw new Error("The file opened but contained no readable text.");
-        setResume(out.value.trim());
-        setFileName(file.name);
-      } else if (file.name.toLowerCase().endsWith(".txt") || file.name.toLowerCase().endsWith(".md")) {
-        const text = await file.text();
-        setResume(text.trim());
-        setFileName(file.name);
-      } else {
-        throw new Error("Use .docx or .txt — for PDF, copy-paste the text instead.");
-      }
+      const text = await extractFileText(file);
+      setResume(text);
+      setFileName(file.name);
     } catch (err) {
       setFileErr(err.message);
       setFileName(null);
+    }
+  };
+
+  /* ── posting file upload (.docx, .txt, .md) ── */
+  const onPostingFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setPostingFileErr(null);
+    try {
+      const text = await extractFileText(file);
+      setPostingPaste(text);
+      setPostingFileName(file.name);
+    } catch (err) {
+      setPostingFileErr(err.message);
+      setPostingFileName(null);
     }
   };
 
@@ -444,35 +485,39 @@ export default function App() {
     return base;
   };
 
-  const runReq = async (p) => {
+  const runReq = async (p, fe = forceEnglish) => {
     const text = p || posting;
     setReqLoading(true); setReqErr(null);
-    try { setReq(await askClaude(reqPrompt(resume, text))); }
+    try {
+      const data = await askClaude(reqPrompt(resume, text, lang, fe));
+      if (data.detected_language && !lang) setLang(data.detected_language);
+      setReq(data);
+    }
     catch (e) { setReqErr(e.message); }
     finally { setReqLoading(false); }
   };
 
-  const runFlags = async (p) => {
+  const runFlags = async (p, fe = forceEnglish) => {
     const text = p || posting;
     setFlagLoading(true); setFlagErr(null);
     try {
-      const data = await askClaude(flagPrompt(resume, text));
+      const data = await askClaude(flagPrompt(resume, text, lang, fe), false, 3000);
       data.red_flags = (data.red_flags || []).map((f, i) => ({ ...f, id: i, status: "open", final_text: null }));
       setFlags(data);
     } catch (e) { setFlagErr(e.message); }
     finally { setFlagLoading(false); }
   };
 
-  const runMarket = async () => {
+  const runMarket = async (fe = forceEnglish) => {
     setMarketLoading(true); setMarketErr(null);
-    try { setMarket(await askClaude(marketPrompt(posting), true, 2500)); }
+    try { setMarket(await askClaude(marketPrompt(posting, lang, fe), true, 2500)); }
     catch (e) { setMarketErr(e.message); }
     finally { setMarketLoading(false); }
   };
 
-  const runPrep = async () => {
+  const runPrep = async (fe = forceEnglish) => {
     setPrepLoading(true); setPrepErr(null);
-    try { setPrep(await askClaude(questionPrompt(posting))); }
+    try { setPrep(await askClaude(questionPrompt(posting, lang, fe))); }
     catch (e) { setPrepErr(e.message); }
     finally { setPrepLoading(false); }
   };
@@ -481,10 +526,21 @@ export default function App() {
     setStage("results");
     setReq(null); setFlags(null); setMarket(null); setPrep(null);
     setMarketOpen(false); setPrepOpen(false); setFetchErr(null);
+    setLang(null); setForceEnglish(false);
     const text = await resolvePosting();
     if (!text) return; // fetch failed; error shown
     runReq(text);
     runFlags(text);
+  };
+
+  // Translate button: flip the whole results view between English and the posting's language.
+  const toggleEnglish = () => {
+    const next = !forceEnglish;
+    setForceEnglish(next);
+    runReq(posting, next);
+    runFlags(posting, next);
+    if (market) runMarket(next);
+    if (prep) runPrep(next);
   };
 
   const updateFlag = (id, patch) => {
@@ -494,7 +550,7 @@ export default function App() {
   const draftFix = async (flag, answer) => {
     updateFlag(flag.id, { drafting: true, draftError: null });
     try {
-      const out = await askClaude(draftPrompt(flag, answer));
+      const out = await askClaude(draftPrompt(flag, answer, lang, forceEnglish));
       updateFlag(flag.id, { drafting: false, suggested_text: out.suggested_text, needs_input: false });
     } catch (e) {
       updateFlag(flag.id, { drafting: false, draftError: e.message });
@@ -502,6 +558,22 @@ export default function App() {
   };
 
   const acceptedFixes = flags ? flags.red_flags.filter((f) => f.status === "accepted" || f.status === "edited") : [];
+
+  // Answer an unknown MUST inline: "yes" → met, "skip" → set aside, "reset" → back to unknown.
+  const answerMust = (index, value) => {
+    setReq((prev) => ({
+      ...prev,
+      musts: prev.musts.map((m, i) => (i === index ? { ...m, met: value } : m)),
+    }));
+  };
+
+  // Answer an unknown blocker: "pass" → confirmed clear, "skipped" → set aside (keeps light yellow), "unknown" → reset.
+  const answerBlocker = (index, status) => {
+    setReq((prev) => ({
+      ...prev,
+      blockers: prev.blockers.map((b, i) => (i === index ? { ...b, status } : b)),
+    }));
+  };
 
   const copyFixes = () => {
     const text = acceptedFixes.map((f) => `• ${f.final_text || f.suggested_text}`).join("\n");
@@ -527,15 +599,60 @@ export default function App() {
       ...req.blockers.filter((b) => b.status === "unknown").map((b) => `? unconfirmed blocker: ${b.text}`),
       ...req.musts.filter((m) => m.met === "unknown").map((m) => `? answer needed: ${m.text}`),
     ];
+    const skippedBlockers = req.blockers.filter((b) => b.status === "skipped");
     const openReds = flags ? flags.red_flags.filter((f) => f.status === "open" || f.status === "editing") : [];
     if (unknowns.length || openReds.length || !flags) {
-      const reasons = ["A bit severe — fixable items are still open."];
+      const reasons = ["A bit severe — fixable or unconfirmed items remain."];
       unknowns.forEach((u) => reasons.push(u));
       if (!flags) reasons.push("… flag review still running");
       else if (openReds.length) reasons.push(`${openReds.length} red flag${openReds.length > 1 ? "s" : ""} unresolved below — resolving them turns this green`);
       return { light: "yellow", reasons };
     }
-    return { light: "green", reasons: ["Totally fine — blockers pass, MUSTs met, every flag resolved. Send it."] };
+    const skippedMusts = req.musts.filter((m) => m.met === "skipped").length;
+    const setAside = skippedMusts + skippedBlockers.length;
+    const reasons = [];
+    if (setAside) {
+      reasons.push(`Clear on what you answered — ${setAside} item${setAside > 1 ? "s" : ""} set aside as not applicable. Send it.`);
+      skippedBlockers.forEach((b) => reasons.push(`⚠ set-aside wall (not confirmed): ${b.text} — make sure this really doesn't apply`));
+    } else {
+      reasons.push("Totally fine — blockers pass, MUSTs met, every flag resolved. Send it.");
+    }
+    return { light: "green", reasons };
+  })();
+
+  /* ── new read: a fresh one-line summary built locally from the user's answers.
+        Returns null until the user has actually answered/resolved something. ── */
+  const newRead = (() => {
+    if (!req) return null;
+    const blockersCleared = req.blockers.filter((b) => b.status === "user_pass").length;
+    const blockersSkipped = req.blockers.filter((b) => b.status === "skipped").length;
+    // Any MUST the user actively set: "yes" on a "?" item (met true + had a question), or skipped.
+    const mustsConfirmed = req.musts.filter((m) => m.met === true && m.question).length;
+    const mustsSkipped = req.musts.filter((m) => m.met === "skipped").length;
+    const fixesResolved = flags ? flags.red_flags.filter((f) => f.status === "accepted" || f.status === "edited" || f.status === "kept").length : 0;
+    const totalActions = blockersCleared + blockersSkipped + mustsConfirmed + mustsSkipped + fixesResolved;
+    if (totalActions === 0) return null; // nothing answered yet — don't show
+
+    const parts = [];
+    if (blockersCleared) parts.push(`${blockersCleared} wall${blockersCleared > 1 ? "s" : ""} confirmed clear`);
+    if (blockersSkipped) parts.push(`${blockersSkipped} wall${blockersSkipped > 1 ? "s" : ""} set aside`);
+    if (mustsConfirmed) parts.push(`${mustsConfirmed} requirement${mustsConfirmed > 1 ? "s" : ""} confirmed`);
+    if (mustsSkipped) parts.push(`${mustsSkipped} not applicable`);
+    if (fixesResolved) parts.push(`${fixesResolved} fix${fixesResolved > 1 ? "es" : ""} handled`);
+
+    const stillOpen =
+      req.blockers.filter((b) => b.status === "unknown").length +
+      req.musts.filter((m) => m.met === "unknown").length +
+      (flags ? flags.red_flags.filter((f) => f.status === "open" || f.status === "editing").length : 0);
+
+    const verdict =
+      blinker.light === "green"
+        ? "Now reading clear — ready to send."
+        : blinker.light === "yellow"
+        ? `${stillOpen} item${stillOpen > 1 ? "s" : ""} still open.`
+        : "Still blocked — see above.";
+
+    return `After your answers: ${parts.join(", ")}. ${verdict}`;
   })();
 
   /* ── input screen ── */
@@ -576,7 +693,7 @@ export default function App() {
             style={{ border: `1px solid ${LINE}`, background: "#FFFFFF", color: INK, minHeight: 160 }}
           />
 
-          {/* posting: url + optional paste */}
+          {/* posting: url + file upload + optional paste */}
           <label style={{ ...mono, fontSize: 12, color: INK }}>JOB POSTING LINK</label>
           <input
             value={postingUrl}
@@ -585,14 +702,22 @@ export default function App() {
             className="w-full rounded-xl p-3.5 text-sm mt-1 mb-3"
             style={{ border: `1px solid ${LINE}`, background: "#FFFFFF", color: INK }}
           />
+          <div className="flex items-center gap-3 mb-2">
+            <label className="px-4 py-2.5 rounded-lg cursor-pointer text-sm" style={{ ...mono, background: INK, color: PAPER }}>
+              …or upload posting file (.docx / .txt)
+              <input type="file" accept=".docx,.txt,.md" onChange={onPostingFile} className="hidden" />
+            </label>
+            {postingFileName && <span style={{ ...mono, fontSize: 13, color: GREEN }}>✓ {postingFileName} loaded</span>}
+          </div>
+          {postingFileErr && <p className="mb-2" style={{ color: RED, fontSize: 13 }}>{postingFileErr}</p>}
           <details className="mb-4">
             <summary style={{ ...mono, fontSize: 12, color: MUTE, cursor: "pointer" }}>
-              + paste posting text instead (or as backup if the link is behind a login)
+              + paste posting text instead (or check what a file/link loaded)
             </summary>
             <textarea
               value={postingPaste}
-              onChange={(e) => setPostingPaste(e.target.value)}
-              placeholder="Paste the posting text…"
+              onChange={(e) => { setPostingPaste(e.target.value); setPostingFileName(null); }}
+              placeholder="Paste the posting text… (an uploaded file fills this box — check it loaded correctly)"
               className="w-full rounded-xl p-4 text-sm mt-2"
               style={{ border: `1px solid ${LINE}`, background: "#FFFFFF", color: INK, minHeight: 140 }}
             />
@@ -650,9 +775,21 @@ export default function App() {
               </p>
             )}
           </div>
-          <button onClick={() => setStage("input")} className="px-3 py-1.5 rounded text-sm" style={{ ...mono, border: `1px solid ${LINE}`, color: INK }}>
-            ← New check
-          </button>
+          <div className="flex items-center gap-2">
+            {lang && lang.toLowerCase() !== "english" && (
+              <button
+                onClick={toggleEnglish}
+                disabled={reqLoading || flagLoading}
+                className="px-3 py-1.5 rounded text-sm disabled:opacity-40"
+                style={{ ...mono, background: INK, color: PAPER }}
+              >
+                {forceEnglish ? `Show in ${lang}` : "Translate to English"}
+              </button>
+            )}
+            <button onClick={() => setStage("input")} className="px-3 py-1.5 rounded text-sm" style={{ ...mono, border: `1px solid ${LINE}`, color: INK }}>
+              ← New check
+            </button>
+          </div>
         </div>
 
         {fetchLoading && <Spinner label="fetching the posting from the link…" />}
@@ -677,15 +814,52 @@ export default function App() {
                       className="px-3 py-1 rounded"
                       style={{
                         ...mono, fontSize: 12,
-                        background: b.status === "fail" ? RED : b.status === "pass" ? GREEN_BG : "#ECEEEC",
-                        color: b.status === "fail" ? "#FFFFFF" : b.status === "pass" ? GREEN : MUTE,
+                        background: b.status === "fail" ? RED : (b.status === "pass" || b.status === "user_pass") ? GREEN_BG : "#ECEEEC",
+                        color: b.status === "fail" ? "#FFFFFF" : (b.status === "pass" || b.status === "user_pass") ? GREEN : MUTE,
+                        textDecoration: b.status === "skipped" ? "line-through" : "none",
                       }}
                     >
-                      {b.status === "fail" ? "✕" : b.status === "pass" ? "✓" : "?"} {b.text}
+                      {b.status === "fail" ? "✕" : (b.status === "pass" || b.status === "user_pass") ? "✓" : b.status === "skipped" ? "—" : "?"} {b.text}
                     </span>
                   ))}
                 </div>
-                <p style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 700, fontSize: 19, color: INK }}>{req.summary}</p>
+                {req.blockers.some((b) => b.status === "unknown") && (
+                  <div className="rounded-lg p-3 mb-3" style={{ background: AMBER_BG, border: `1px solid ${AMBER}` }}>
+                    <p className="mb-2" style={{ ...mono, fontSize: 12, color: AMBER }}>UNCONFIRMED WALLS — confirm or set aside</p>
+                    {req.blockers.map((b, i) =>
+                      b.status === "unknown" ? (
+                        <div key={i} className="flex items-center justify-between gap-3 py-1 flex-wrap">
+                          <span style={{ color: INK, fontSize: 14 }}>{b.text}</span>
+                          <div className="flex gap-2">
+                            <button onClick={() => answerBlocker(i, "user_pass")} className="px-3 py-1 rounded text-sm" style={{ ...mono, background: GREEN, color: "#FFFFFF" }}>
+                              ✓ I clear this
+                            </button>
+                            <button onClick={() => answerBlocker(i, "skipped")} className="px-3 py-1 rounded text-sm" style={{ ...mono, border: `1px solid ${AMBER}`, color: AMBER }}>
+                              Skip
+                            </button>
+                          </div>
+                        </div>
+                      ) : null
+                    )}
+                  </div>
+                )}
+                {req.blockers.some((b) => b.status === "user_pass" || b.status === "skipped") && (
+                  <button
+                    onClick={() => setReq((prev) => ({ ...prev, blockers: prev.blockers.map((b) => (b.status === "user_pass" || b.status === "skipped" ? { ...b, status: "unknown" } : b)) }))}
+                    className="mb-3 text-sm"
+                    style={{ ...mono, color: MUTE, textDecoration: "underline" }}
+                  >
+                    reset blocker answers
+                  </button>
+                )}
+                <p style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 700, fontSize: 15, color: MUTE }}>
+                  <span style={{ color: INK }}>Initial read:</span> {req.summary}
+                </p>
+                {newRead && (
+                  <p className="mt-2 rounded-lg p-3" style={{ fontFamily: "'Archivo', sans-serif", fontWeight: 700, fontSize: 15, color: blinker.light === "green" ? GREEN : blinker.light === "yellow" ? AMBER : RED, background: blinker.light === "green" ? GREEN_BG : blinker.light === "yellow" ? AMBER_BG : RED_BG }}>
+                    {newRead}
+                  </p>
+                )}
               </>
             )}
           </div>
@@ -730,13 +904,30 @@ export default function App() {
             <div className="rounded-xl overflow-hidden" style={{ border: `1px solid ${LINE}`, background: "#FFFFFF" }}>
               {req.musts.map((m, i) => (
                 <div key={i} className="px-4 py-3 flex items-start gap-3" style={{ borderBottom: `1px solid ${LINE}` }}>
-                  <span style={{ ...mono, fontSize: 12, color: m.met === true ? GREEN : m.met === "unknown" ? AMBER : RED, minWidth: 60 }}>
-                    {m.met === true ? "✓ MET" : m.met === "unknown" ? "? ASK" : "✕ MUST"}
+                  <span style={{ ...mono, fontSize: 12, color: m.met === true ? GREEN : m.met === "unknown" ? AMBER : m.met === "skipped" ? MUTE : RED, minWidth: 60 }}>
+                    {m.met === true ? "✓ MET" : m.met === "unknown" ? "? ASK" : m.met === "skipped" ? "— SKIP" : "✕ MUST"}
                   </span>
-                  <div>
-                    <p style={{ color: INK, fontSize: 14 }}>{m.text}</p>
+                  <div className="flex-1">
+                    <p style={{ color: m.met === "skipped" ? MUTE : INK, fontSize: 14, textDecoration: m.met === "skipped" ? "line-through" : "none" }}>{m.text}</p>
                     {m.met === false && m.time_to_fill && <p style={{ color: MUTE, fontSize: 13 }}>fillable — est. {m.time_to_fill}</p>}
-                    {m.met === "unknown" && m.question && <p style={{ color: INK, fontSize: 13, fontWeight: 600 }}>{m.question}</p>}
+                    {m.met === "unknown" && m.question && (
+                      <>
+                        <p style={{ color: INK, fontSize: 13, fontWeight: 600 }}>{m.question}</p>
+                        <div className="flex gap-2 mt-2">
+                          <button onClick={() => answerMust(i, true)} className="px-3 py-1 rounded text-sm" style={{ ...mono, background: GREEN, color: "#FFFFFF" }}>
+                            ✓ Yes, I have this
+                          </button>
+                          <button onClick={() => answerMust(i, "skipped")} className="px-3 py-1 rounded text-sm" style={{ ...mono, border: `1px solid ${LINE}`, color: MUTE }}>
+                            Skip — not relevant
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {(m.met === true || m.met === "skipped") && m.question && (
+                      <button onClick={() => answerMust(i, "unknown")} className="mt-1 text-sm" style={{ ...mono, color: MUTE, textDecoration: "underline" }}>
+                        change answer
+                      </button>
+                    )}
                   </div>
                 </div>
               ))}
