@@ -1,25 +1,16 @@
-# Resume Evaluator
+# React + Vite
 
-A tool I built for my own job search. It checks a resume against a specific job
-posting and shows where they match and where they don't.
+This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
 
-Source code for a tool I run in my own environment.
+Currently, two official plugins are available:
 
-## What it does
+- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
+- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
 
-- Compares your resume to a job posting and flags hard blockers (visa, clearance, degree, minimum experience)
-- Shows which requirements you meet, which are missing, and which are fillable
-- Reviews the resume for red flags and suggests rewrites
-- Checks ATS keywords from the posting against your resume
-- Finds similar open roles, sorted by salary
-- Generates likely interview questions from the posting
+## React Compiler
 
-## How it works
+The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
 
-You paste in a resume and a job posting (or a posting URL), and the app uses the
-Claude API to run the comparison and return the results. Built with React.
+## Expanding the ESLint configuration
 
-## Notes
-
-I made this because I wanted one place to see the whole picture of an application
-before submitting it. Built with AI assistance, and I'm still editing it as I use it.
+If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
